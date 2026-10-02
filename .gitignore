@@ -1,0 +1,8 @@
+.venv/
+outputs/
+logs/*
+!logs/.gitkeep
+wandb/
+__pycache__/
+
+.env

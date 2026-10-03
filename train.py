@@ -12,6 +12,10 @@ print(torch.__version__, "Cuda:", torch.cuda.is_available(), torch.version.cuda)
 DATA_DIR = os.path.expandvars("/work/$USER/c4_gpt2")
 BLOCK_SIZE = 1024
 
+SECOND_PER_STEP = 0.06  # Estimated
+TIME_BUDGET = 1800 - 20 # 30 min (in second) - 20 estimated setup time
+MAX_STEPS = int(TIME_BUDGET / SECOND_PER_STEP)
+
 # Prepare tokenizer and model
 print("=== Loading tokenizer and model...")
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -39,7 +43,9 @@ training_args = TrainingArguments(
     output_dir="./results",
     per_device_train_batch_size=2,
     num_train_epochs=1,
+    max_steps=MAX_STEPS,
     logging_steps=10,
+    report_to="wandb",  # Log to W&B, 
 )
 print("=== Training arguments: ", training_args)
 

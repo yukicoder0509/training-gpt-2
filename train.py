@@ -43,15 +43,33 @@ val_ds = TokenBlocks(os.path.join(DATA_DIR, "val.bin"), BLOCK_SIZE)
 # Training arg
 training_args = TrainingArguments(
     output_dir="./results",
-    per_device_train_batch_size=2,
+    # Global batch = per_device * grad_accum * num_gpus = 32 * 8 * 2 = 512 sequences  [gpt1]
+    per_device_train_batch_size=32,
+    gradient_accumulation_steps=8,
+    bf16=True,
     num_train_epochs=1,
     max_steps=MAX_STEPS,
-    logging_steps=10,
-    report_to="wandb",  # Log to W&B, 
 
-    # enable evaluation
+    # Logging, eval and reporting
+    logging_steps=10,
+    report_to="wandb",  # Log to W&B
     eval_strategy="steps",
     eval_steps=100,
+    save_steps=100,
+    save_total_limit=3,
+
+    # Optimizer
+    optim="adamw_torch",
+    learning_rate=2.5e-4,
+    adam_beta1=0.9,
+    adam_beta2=0.95,
+    adam_epsilon=1e-8,
+    weight_decay=0.1,  # [choice] GPT-1 used 0.01; 0.1 is the GPT-3/nanoGPT value
+
+    # Scheduler: linear warmup then cosine decay  [gpt1]
+    lr_scheduler_type="cosine_with_min_lr",
+    lr_scheduler_kwargs={"min_lr_rate": 0.1},   # decay to 10% of peak; use "cosine" for ->0
+    warmup_steps=100,
 )
 print("=== Training arguments: ", training_args)
 
@@ -75,3 +93,20 @@ trainer = PPLTrainer(
 print("=== Starting training...")
 trainer.train()
 print("=== Training finished.")
+
+
+
+# OpenAI team hyperparameters
+"""
+Batch size: 512 sequences.
+Adam with a max learning rate of 2.5e-4
+Linear warmup over 2,000 updates, then cosine annealing
+Dropout of 0.1
+Modified L2 weight decay of 0.01
+
+If you're trying to reproduce GPT-2 training,
+ community reproductions like Karpathy's nanoGPT and llm.c 
+ are the practical reference. 
+ They fill in the missing values, 
+ for example a peak learning rate around 6e-4 for 124M and AdamW with betas (0.9, 0.95). Those values are their choices, not OpenAI's.
+"""

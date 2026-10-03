@@ -13,6 +13,7 @@
 
 source $HOME/.bashrc
 source ${VENV:-$HOME/training-gpt-2/.venv}/bin/activate
+source $HOME/training-gpt-2/.env
 
 # Log to the team W&B server (cerulean-labs/gpt2-training) instead of the personal wandb.ai account.
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://api.forge.coreweave.com}
@@ -31,7 +32,7 @@ accelerate launch \
     --multi_gpu \
     --num_processes=2 \
     --mixed_precision=bf16 \
-    train.py
+    train.py --model_name=$MODEL_NAME
 
 END_TIME=$(date +%s)
 echo "========================================"

@@ -5,6 +5,7 @@ import numpy as np
 import math
 from torch.utils.data import Dataset
 import os
+import sys
 
 # Check GPU availability
 print(torch.__version__, "Cuda:", torch.cuda.is_available(), torch.version.cuda)
@@ -12,8 +13,9 @@ print(torch.__version__, "Cuda:", torch.cuda.is_available(), torch.version.cuda)
 # Constants
 DATA_DIR = os.path.expandvars("/work/$USER/c4_gpt2")
 BLOCK_SIZE = 1024
+MODEL_NAME = sys.argv[1]
 
-SECOND_PER_STEP = 0.06  # Estimated
+SECOND_PER_STEP = 1.9  # Estimated
 TIME_BUDGET = 1800 - 20 # 30 min (in second) - 20 estimated setup time
 # MAX_STEPS = int(TIME_BUDGET / SECOND_PER_STEP)
 MAX_STEPS = 200
@@ -92,9 +94,8 @@ trainer = PPLTrainer(
 # Train
 print("=== Starting training...")
 trainer.train()
+model.push_to_hub(MODEL_NAME)
 print("=== Training finished.")
-
-
 
 # OpenAI team hyperparameters
 """

@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, TrainerCallback
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, TrainingArguments, Trainer, TrainerCallback
 from datasets import load_dataset
 import torch
 import numpy as np
@@ -16,14 +16,15 @@ BLOCK_SIZE = 1024
 MODEL_NAME = sys.argv[1]
 
 SECOND_PER_STEP = 1.9  # Estimated
-TIME_BUDGET = 1800 - 20 # 30 min (in second) - 20 estimated setup time
-# MAX_STEPS = int(TIME_BUDGET / SECOND_PER_STEP)
-MAX_STEPS = 200
+TIME_BUDGET = 1800 - 300 # 30 min (in second) - 300 estimated setup + upload time
+MAX_STEPS = int(TIME_BUDGET / SECOND_PER_STEP)
 
 # Prepare tokenizer and model
 print("=== Loading tokenizer and model...")
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
-model = AutoModelForCausalLM.from_pretrained("gpt2")
+
+config = AutoConfig.from_pretrained("gpt2")
+model = AutoModelForCausalLM.from_config(config)
 
 # Load English C4 dataset
 print("=== Loading English C4 dataset...")
@@ -56,7 +57,7 @@ training_args = TrainingArguments(
     logging_steps=10,
     report_to="wandb",  # Log to W&B
     eval_strategy="steps",
-    eval_steps=100,
+    eval_steps=20,
     save_steps=100,
     save_total_limit=3,
 

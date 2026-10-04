@@ -5,7 +5,7 @@ import numpy as np
 import math
 from torch.utils.data import Dataset
 import os
-import sys
+import argparse
 
 # Check GPU availability
 print(torch.__version__, "Cuda:", torch.cuda.is_available(), torch.version.cuda)
@@ -13,7 +13,14 @@ print(torch.__version__, "Cuda:", torch.cuda.is_available(), torch.version.cuda)
 # Constants
 DATA_DIR = os.path.expandvars("/work/$USER/c4_gpt2")
 BLOCK_SIZE = 1024
-MODEL_NAME = sys.argv[1]
+
+# Argument
+parser = argparse.ArgumentParser()
+parser.add_argument("--model_name", type=str, required=True, help="Name of the model to be used (also the Hub repo to push to)")
+args = parser.parse_args()
+MODEL_NAME = args.model_name
+
+print("Model name:", MODEL_NAME)
 
 SECOND_PER_STEP = 1.9  # Estimated
 TIME_BUDGET = 1800 - 300 # 30 min (in second) - 300 estimated setup + upload time

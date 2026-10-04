@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=1
 #SBATCH --gpus-per-node=2
-#SBATCH --exclude=25a-hgpn003
+#SBATCH --exclude=25a-hgpn001,25a-hgpn003
 #SBATCH --time=0:30:00
 #SBATCH --output=logs/%x-%j.out
 
@@ -32,7 +32,8 @@ accelerate launch \
     --multi_gpu \
     --num_processes=2 \
     --mixed_precision=bf16 \
-    train.py --model_name=$MODEL_NAME
+    --main_process_port=$((29500 + SLURM_JOB_ID % 1000)) \
+    train.py --model_name=$MODEL_NAME "$@"
 
 END_TIME=$(date +%s)
 echo "========================================"
@@ -42,3 +43,4 @@ echo "========================================"
 
 # Note:
 # --nodelist=25a-hgpn008  # hgpn003 breaks multi-GPU jobs (jobs 493252, 493275, 493290)
+# hgpn001: both ranks land on the same GPU -> NCCL "Multiple Ranks are using the same GPU" (job 496208)

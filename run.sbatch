@@ -20,6 +20,10 @@ export WANDB_BASE_URL=${WANDB_BASE_URL:-https://api.forge.coreweave.com}
 export WANDB_ENTITY=${WANDB_ENTITY:-cerulean-labs}
 export WANDB_PROJECT=${WANDB_PROJECT:-gpt2-training}  # HF Trainer otherwise defaults to project "huggingface"
 
+# Single-node jobs: NCCL bootstrap over loopback. On some nodes (hgpn122/123/124/151) it picked an
+# unroutable interface and hung ~10 min ("No route to host"), jobs 496710-496729.
+export NCCL_SOCKET_IFNAME=lo
+
 echo "========================================"
 echo "Start Time: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "Node: $(hostname)  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"

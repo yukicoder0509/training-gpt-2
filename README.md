@@ -27,19 +27,23 @@ OUT_DIR=~/c4_gpt2_dclm_5b sbatch prepare.sbatch --target_train_tokens 5000000000
 ## 2. Train
 
 ```
-sbatch --job-name=gpt2-c4-wsd20 run.sbatch --learning_rate=1.25e-3 --decay_frac=0.2 --run_name=wsd20-lr1.25e-3
+sbatch --job-name=gpt2-c4-bs128 run.sbatch --decay_frac=0.2 --run_name=adamw-bs128-wsd20
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--learning_rate` | `1.25e-3` | Peak LR |
+| `--global_batch_size` | `128` | Sequences per optimizer step (32 per GPU × grad accum × 2 GPUs); must have a measured step time in `SEC_PER_STEP` (64, 128, 256, 512) or pass `--sec_per_step` |
+| `--optimizer` | `adamw` | `adamw` or `adam_mini` |
+| `--weight_decay` | `0.01` | AdamW weight decay |
+| `--beta2` | `0.95` | Adam β2 |
 | `--decay_frac` | `0` | `0`: constant after warmup; `>0`: warmup-stable-decay, linear decay to 0 over this fraction of the final steps |
 | `--data_dir` | `/work/$USER/c4_gpt2` | Directory with `train.bin` and `val.bin` |
 | `--run_name` | none | W&B run name; also names the save directory |
 | `--save_dir` | `~/gpt2_models/<run_name or latest>` | Where the final model is saved |
 
-The step count is derived from the 30-min job limit (`TIME_BUDGET` / `SECOND_PER_STEP` in
-`train.py`). Warmup is 10% of the steps. If training runs slow, it stops 90 s before the limit and
+The step count fills the 30-min job limit: `(TIME_BUDGET − 37 evals × EVAL_SEC) / SEC_PER_STEP[batch]`
+in `train.py` (batch 128 → 2885 steps). Warmup is 10% of the steps. If training runs slow, it stops 90 s before the limit and
 still saves the model. Losses go to W&B (`cerulean-labs/gpt2-training`) and `logs/<job-name>-<job-id>.out`.
 
 ## 3. Push to the Hub
@@ -50,7 +54,7 @@ so it doesn't need Slurm:
 
 ```
 source .venv/bin/activate && source .env
-python push_model.py --model_dir ~/gpt2_models/wsd20-lr1.25e-3 --repo_id $MODEL_NAME --message "WSD20 lr1.25e-3, eval 4.21"
+python push_model.py --model_dir ~/gpt2_models/adamw-bs128-wsd20 --repo_id $MODEL_NAME --message "bs128 WSD20, eval 3.79"
 ```
 
 The last lines of the training log print this command with the right paths.

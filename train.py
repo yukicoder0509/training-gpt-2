@@ -21,12 +21,17 @@ BLOCK_SIZE = 1024
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_name", type=str, required=True, help="Hub repo the saved model is meant for (pushed separately with push_model.py)")
 parser.add_argument("--learning_rate", type=float, default=1.25e-3, help="Peak LR, held constant after warmup")
-parser.add_argument("--decay_frac", type=float, default=0.0, help="0: constant after warmup; >0: warmup-stable-decay, linear decay to 0 over this fraction of the final steps")
+parser.add_argument("--decay_frac", type=float, default=0.2, help="0: constant after warmup; >0: warmup-stable-decay, linear decay to 0 over this fraction of the final steps")
 parser.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay (GPT-1: 0.01, GPT-3/nanoGPT: 0.1)")
 parser.add_argument("--beta2", type=float, default=0.95, help="Adam beta2 for both optimizers (0.95: GPT-3/nanoGPT; 0.999: PyTorch default)")
-parser.add_argument("--global_batch_size", type=int, default=128, help="Sequences per optimizer step (32 per GPU x grad accum x GPUs)")
+parser.add_argument("--global_batch_size", type=int, default=128, help="Sequences per optimizer step (per-GPU batch x grad accum x GPUs)")
+parser.add_argument("--per_device_batch", type=int, default=64, help="Max sequences per GPU per micro-batch; grad accum covers the rest")
+parser.add_argument("--dropout", type=float, default=0.0, help="Sets GPT-2's resid_pdrop, attn_pdrop and embd_pdrop (GPT-2 used 0.1; 0 won at < 0.2 epoch, job 500119)")
+parser.add_argument("--activation", type=str, default="gelu_pytorch_tanh", help="MLP activation: gelu_pytorch_tanh (fused, same formula) or gelu_new (GPT-2 original, ~8 elementwise kernels)")
 parser.add_argument("--sec_per_step", type=float, default=None, help="Override the measured train-step time (s, excl. eval) used to size the run")
 parser.add_argument("--max_steps", type=int, default=None, help="Override the time-budgeted step count (e.g. short speed tests)")
+parser.add_argument("--torch_compile", action="store_true", help="torch.compile the model (fuses elementwise/cast kernels; compile time counts against the budget)")
+parser.add_argument("--profile_dir", type=str, default=None, help="Profile steps 9-13 with torch.profiler into this dir (disables eval); see profile.sbatch")
 parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini"], help="adamw (torch AdamW) or adam_mini (Adam-mini, pip adam-mini)")
 parser.add_argument("--data_dir", type=str, default=os.path.expandvars("/work/$USER/c4_gpt2"), help="Dir with train.bin and val.bin")
 parser.add_argument("--run_name", type=str, default=None, help="W&B run name; also isolates checkpoints in results/<run_name>")
@@ -41,16 +46,22 @@ print("Model name:", MODEL_NAME, "LR:", args.learning_rate, "Optimizer:", args.o
 # The Hub upload runs after the job (push_model.py), so the 30-min limit only covers startup,
 # training and a local save: ~40 s startup, local save + W&B finish < 30 s.
 JOB_TIME_LIMIT = 1800
-TIME_BUDGET = JOB_TIME_LIMIT - 60 - 30 - 120  # startup, save + W&B finish, safety margin
+# Measured in job 500119 (1449 s total): 9 s from script start to first step, 34 s outside the script
+# (venv/accelerate start + W&B finish after the save).
+TIME_BUDGET = JOB_TIME_LIMIT - 30 - 45 - 120  # startup, save + W&B finish + launcher, safety margin
 # Fixed number of evals (not fixed interval), so eval time doesn't grow when small batches run more steps.
 NUM_EVALS = 37
-EVAL_SEC = 6.4  # 5k val docs; measured 6.34 s/eval (job 497297)
-# Median train-step time (s, excl. eval) on 2 GPUs, 32 seqs/GPU, by global batch size.
-# Speed tests 497502-497505 (median over 45-155 steps); 512 matches the full run 497297 (1.824 s).
-SEC_PER_STEP = {64: 0.249, 128: 0.469, 256: 0.912, 512: 1.824}
-PER_DEVICE_BATCH = 32
+EVAL_SEC = 2.6  # 5k val docs; measured 2.49 s/eval (max 2.54) with gelu_pytorch_tanh (job 500119); was 6.34 with gelu_new
+# Train-step time (s, excl. eval) on 2 GPUs by global batch size, with 24 CPUs, gelu_pytorch_tanh and
+# up to 64 seqs/GPU. 128: mean over a full dropout-0 run (job 500119: (1408 s train_runtime - 94.5 s eval) / 4407),
+# which includes logging overhead. 64/256/512: medians from speed jobs 499817-499819 with dropout 0.1 (~3% conservative).
+# Re-measure with profile.sbatch if the setup changes.
+# Before the throughput fixes (1 CPU, gelu_new, 32/GPU): 64: 0.249, 128: 0.469, 256: 0.912, 512: 1.824.
+SEC_PER_STEP = {64: 0.161, 128: 0.298, 256: 0.606, 512: 1.208}
+# Fewer, larger micro-batches: fewer kernel launches and fewer autocast weight casts per step (profile 499746).
+PER_DEVICE_BATCH = min(args.per_device_batch, args.global_batch_size // int(os.environ.get("WORLD_SIZE", 1)))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
-assert args.global_batch_size % (PER_DEVICE_BATCH * WORLD_SIZE) == 0, "global batch must be a multiple of 32 x GPUs"
+assert args.global_batch_size % (PER_DEVICE_BATCH * WORLD_SIZE) == 0, "global batch must be a multiple of per-GPU batch x GPUs"
 GRAD_ACCUM = args.global_batch_size // (PER_DEVICE_BATCH * WORLD_SIZE)
 sec_per_step = args.sec_per_step or SEC_PER_STEP.get(args.global_batch_size)
 if args.max_steps:
@@ -59,7 +70,7 @@ else:
     assert sec_per_step, f"no measured step time for batch {args.global_batch_size}; run a speed test or pass --sec_per_step"
     MAX_STEPS = int((TIME_BUDGET - NUM_EVALS * EVAL_SEC) / sec_per_step)
 EVAL_STEPS = max(1, MAX_STEPS // NUM_EVALS)
-print(f"Global batch {args.global_batch_size} (grad accum {GRAD_ACCUM}), {MAX_STEPS} steps, eval every {EVAL_STEPS}")
+print(f"Global batch {args.global_batch_size} ({PER_DEVICE_BATCH}/GPU x grad accum {GRAD_ACCUM}), {MAX_STEPS} steps, eval every {EVAL_STEPS}")
 WARMUP_STEPS = int(0.1 * MAX_STEPS)
 DECAY_STEPS = int(args.decay_frac * MAX_STEPS)
 
@@ -67,8 +78,17 @@ DECAY_STEPS = int(args.decay_frac * MAX_STEPS)
 print("=== Loading tokenizer and model...")
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
-config = AutoConfig.from_pretrained("gpt2")
+# Weight init as in GPT-1/GPT-2: N(0, 0.02) for Linear/Conv1D/embedding weights, zero biases; GPT2's
+# _init_weights also scales each block's residual output proj (c_proj) by 1/sqrt(2 * n_layer).
+# 0.02 is already gpt2's config value; set explicitly so the choice is visible.
+# gelu_pytorch_tanh is the same tanh approximation as GPT-2's gelu_new, but one fused kernel instead of ~8
+# elementwise ones (generic elementwise kernels were ~29% of GPU time in profile 499746).
+config = AutoConfig.from_pretrained(
+    "gpt2", initializer_range=0.02, activation_function=args.activation,
+    resid_pdrop=args.dropout, attn_pdrop=args.dropout, embd_pdrop=args.dropout,
+)
 model = AutoModelForCausalLM.from_config(config)
+print("Attention implementation:", model.config._attn_implementation)
 
 # Load English C4 dataset
 print("=== Loading English C4 dataset...")
@@ -95,13 +115,14 @@ training_args = TrainingArguments(
     per_device_train_batch_size=PER_DEVICE_BATCH,
     gradient_accumulation_steps=GRAD_ACCUM,
     bf16=True,
+    torch_compile=args.torch_compile,
     num_train_epochs=1,
     max_steps=MAX_STEPS,
 
     # Logging, eval and reporting
     logging_steps=10,
     report_to="wandb",  # Log to W&B
-    eval_strategy="steps",
+    eval_strategy="no" if args.profile_dir else "steps",
     eval_steps=EVAL_STEPS,
     save_strategy="no",
 
@@ -139,6 +160,11 @@ class DeadlineCallback(TrainerCallback):
 
 # Times each optimizer step (on_step_begin -> on_step_end excludes eval) and prints the median at the end,
 # to fill SEC_PER_STEP for new batch sizes.
+# Model FLOPs per token (fwd + bwd): 6 * params + attention 12 * n_layer * n_embd * seq_len (PaLM/nanoGPT
+# MFU formula). Peak: H200 dense bf16 ~989 TFLOPS per GPU.
+FLOPS_PER_TOKEN = 6 * sum(p.numel() for p in model.parameters()) + 12 * config.n_layer * config.n_embd * BLOCK_SIZE
+PEAK_FLOPS_PER_GPU = 989e12
+
 class StepTimerCallback(TrainerCallback):
     def __init__(self):
         self.times, self.t0 = [], None
@@ -148,6 +174,14 @@ class StepTimerCallback(TrainerCallback):
 
     def on_step_end(self, args, state, control, **kwargs):
         self.times.append(time.time() - self.t0)
+        if state.global_step == 1 and state.is_world_process_zero:  # includes torch.compile time if enabled
+            print(f"=== First step done at {time.time() - START_TIME:.0f}s ({self.times[0]:.1f}s for step 1)")
+
+    def recent_throughput(self, num_steps):
+        """Training tokens/s (all GPUs) and MFU over the last num_steps optimizer steps, eval excluded."""
+        recent = self.times[-num_steps:]
+        tokens_per_sec = args.global_batch_size * BLOCK_SIZE * len(recent) / sum(recent)
+        return tokens_per_sec, tokens_per_sec * FLOPS_PER_TOKEN / (PEAK_FLOPS_PER_GPU * WORLD_SIZE)
 
     def on_train_end(self, args, state, control, **kwargs):
         if state.is_world_process_zero and len(self.times) > 10:
@@ -173,11 +207,56 @@ if args.optimizer == "adam_mini":
     optimizer.embd_names.add("wpe")
 
 # Trainer
+step_timer = StepTimerCallback()
+
+# torch.profiler over a few steady-state steps: Chrome trace per rank, plus (rank 0) top ops by GPU and
+# CPU time and the GPU busy fraction (sum of GPU kernel time / wall time; NCCL overlap can push it above 100%).
+class ProfilerCallback(TrainerCallback):
+    WAIT, WARMUP, ACTIVE = 5, 3, 5
+
+    def __init__(self, out_dir):
+        self.out_dir, self.t_active = out_dir, None
+        os.makedirs(out_dir, exist_ok=True)
+        self.prof = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=self.WAIT, warmup=self.WARMUP, active=self.ACTIVE, repeat=1),
+            on_trace_ready=self.report,
+        )
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.prof.start()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        torch.cuda.synchronize()
+        if state.global_step == self.WAIT + self.WARMUP:
+            self.t_active = time.time()  # active window starts with the next step
+        self.prof.step()
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self.prof.stop()
+
+    def report(self, prof):
+        wall = time.time() - self.t_active
+        rank = int(os.environ.get("RANK", 0))
+        prof.export_chrome_trace(os.path.join(self.out_dir, f"trace_rank{rank}.json"))
+        if rank != 0:
+            return
+        events = prof.key_averages()
+        dev = lambda e: getattr(e, "self_device_time_total", 0) or getattr(e, "self_cuda_time_total", 0)
+        gpu_us = sum(dev(e) for e in events)
+        print(f"=== Profile: {self.ACTIVE} steps, wall {wall:.3f} s ({wall / self.ACTIVE:.3f} s/step), "
+              f"GPU kernel time {gpu_us / 1e6:.3f} s -> GPU busy {gpu_us / 1e6 / wall:.0%}, CPUs available {len(os.sched_getaffinity(0))}")
+        for key in ("self_device_time_total", "self_cpu_time_total"):
+            print(f"=== Top ops by {key}")
+            print(events.table(sort_by=key, row_limit=25, max_name_column_width=60))
+
 class CustomTrainer(Trainer):
     # Log PPL
     def log(self, logs, *args, **kwargs):
         if "loss" in logs:
             logs["ppl"] = math.exp(logs["loss"])
+            if step_timer.times:
+                logs["tokens_per_sec"], logs["mfu"] = step_timer.recent_throughput(self.args.logging_steps)
         if "eval_loss" in logs:
             logs["eval_ppl"] = math.exp(logs["eval_loss"])
         super().log(logs, *args, **kwargs) # Override the log to include perplexity (ppl)
@@ -188,7 +267,8 @@ trainer = CustomTrainer(
     args=training_args,
     train_dataset=train_ds,
     eval_dataset=val_ds,
-    callbacks=[DeadlineCallback(START_TIME + JOB_TIME_LIMIT - 90), StepTimerCallback()],
+    callbacks=[DeadlineCallback(START_TIME + JOB_TIME_LIMIT - 90), step_timer]
+    + ([ProfilerCallback(args.profile_dir)] if args.profile_dir else []),
     optimizers=(optimizer, None),  # None -> Trainer builds AdamW from args; scheduler always from args
 )
 

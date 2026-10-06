@@ -29,6 +29,7 @@ parser.add_argument("--global_batch_size", type=int, default=128, help="Sequence
 parser.add_argument("--per_device_batch", type=int, default=64, help="Max sequences per GPU per micro-batch; grad accum covers the rest")
 parser.add_argument("--dropout", type=float, default=0.0, help="Sets GPT-2's resid_pdrop, attn_pdrop and embd_pdrop (GPT-2 used 0.1; 0 won at < 0.2 epoch, job 500119)")
 parser.add_argument("--pad_vocab", action=argparse.BooleanOptionalAction, default=False, help="Pad the vocab 50257 -> 50304 (multiple of 128) for fast LM-head GEMMs; trimmed back before saving. On in run.sbatch/profile.sbatch; --no-pad_vocab disables")
+parser.add_argument("--fused_ce", action=argparse.BooleanOptionalAction, default=False, help="Liger fused LM head + cross-entropy: never materializes the full fp32 logits. On in run.sbatch/profile.sbatch; --no-fused_ce disables")
 parser.add_argument("--activation", type=str, default="gelu_pytorch_tanh", help="MLP activation: gelu_pytorch_tanh (fused, same formula) or gelu_new (GPT-2 original, ~8 elementwise kernels)")
 parser.add_argument("--sec_per_step", type=float, default=None, help="Override the measured train-step time (s, excl. eval) used to size the run")
 parser.add_argument("--max_steps", type=int, default=None, help="Override the time-budgeted step count (e.g. short speed tests)")
@@ -55,12 +56,13 @@ TIME_BUDGET = JOB_TIME_LIMIT - 30 - 45 - 120  # startup, save + W&B finish + lau
 NUM_EVALS = 37
 EVAL_SEC = 2.6  # 5k val docs; measured 2.49 s/eval (max 2.54) with gelu_pytorch_tanh (job 500119); was 6.34 with gelu_new
 # Train-step time (s, excl. eval) on 2 GPUs by global batch size, with 24 CPUs, gelu_pytorch_tanh, up to
-# 64 seqs/GPU, dropout 0 and --pad_vocab (the run.sbatch default). Medians from padded speed jobs 503436-503439
-# (64: 0.104, 128: 0.195, 256: 0.386, 512: 0.757), scaled by 1.017 = full-run mean / speed-job median without
+# 64 seqs/GPU, dropout 0, --pad_vocab and --fused_ce (the run.sbatch defaults). Medians from speed jobs 504142-504145
+# (64: 0.091, 128: 0.156, 256: 0.308, 512: 0.617), scaled by 1.017 = full-run mean / speed-job median without
 # padding (job 500119: 0.298 incl. logging, vs 0.293 median in 503440). Re-measure with profile.sbatch if the setup changes.
-# Without --pad_vocab: 64: 0.161, 128: 0.298, 256: 0.606, 512: 1.208 (pass --sec_per_step to size such a run).
+# --pad_vocab without --fused_ce (503436-503439): 64: 0.106, 128: 0.198, 256: 0.393, 512: 0.770.
+# Neither: 64: 0.161, 128: 0.298, 256: 0.606, 512: 1.208. Pass --sec_per_step to size such runs.
 # Before the throughput fixes (1 CPU, gelu_new, 32/GPU): 64: 0.249, 128: 0.469, 256: 0.912, 512: 1.824.
-SEC_PER_STEP = {64: 0.106, 128: 0.198, 256: 0.393, 512: 0.770}
+SEC_PER_STEP = {64: 0.093, 128: 0.159, 256: 0.313, 512: 0.627}
 # Fewer, larger micro-batches: fewer kernel launches and fewer autocast weight casts per step (profile 499746).
 PER_DEVICE_BATCH = min(args.per_device_batch, args.global_batch_size // int(os.environ.get("WORLD_SIZE", 1)))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
@@ -95,6 +97,29 @@ config = AutoConfig.from_pretrained(
 )
 model = AutoModelForCausalLM.from_config(config)
 print("Attention implementation:", model.config._attn_implementation)
+
+# Fused LM head + cross-entropy (Liger): computes the logits, loss and their gradients chunk by chunk inside
+# the forward, instead of HF's full (tokens x vocab) logits upcast to fp32 for log_softmax (~13% of GPU time and
+# most of the memory, profile 503423). Same shift and normalization as HF's ForCausalLMLoss: sum / num_items_in_batch
+# when the Trainer passes it (grad accum), else mean. Patched on the instance so the saved config stays GPT2LMHeadModel.
+if args.fused_ce:
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+    from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+    fused_ce = {r: LigerFusedLinearCrossEntropyLoss(reduction=r) for r in ("mean", "sum")}
+
+    def fused_ce_forward(input_ids=None, labels=None, num_items_in_batch=None, **kwargs):
+        hidden = model.transformer(input_ids=input_ids, **kwargs).last_hidden_state
+        if labels is None:
+            return CausalLMOutputWithCrossAttentions(logits=model.lm_head(hidden))
+        hidden = hidden[:, :-1].reshape(-1, hidden.size(-1))  # tokens < n predict n
+        targets = labels[:, 1:].reshape(-1)
+        if num_items_in_batch is None:
+            loss = fused_ce["mean"](model.lm_head.weight, hidden, targets)
+        else:
+            loss = fused_ce["sum"](model.lm_head.weight, hidden, targets) / num_items_in_batch
+        return CausalLMOutputWithCrossAttentions(loss=loss)
+
+    model.forward = fused_ce_forward
 
 # Load English C4 dataset
 print("=== Loading English C4 dataset...")

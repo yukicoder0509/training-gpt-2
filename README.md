@@ -36,6 +36,7 @@ sbatch --job-name=gpt2-c4 run.sbatch --run_name=my-run   # defaults = current be
 | `--global_batch_size` | `128` | Sequences per optimizer step (per-GPU batch × grad accum × 2 GPUs); must have a measured step time in `SEC_PER_STEP` (64, 128, 256, 512) or pass `--sec_per_step` |
 | `--per_device_batch` | `64` | Max sequences per GPU per micro-batch; grad accum covers the rest |
 | `--pad_vocab` / `--no-pad_vocab` | on in `run.sbatch` / `profile.sbatch` (off when calling `train.py` directly) | Pad the vocab 50257 → 50304 so the LM-head matmuls use fast Hopper kernels (1.5× faster steps); trimmed back to 50257 before saving. `SEC_PER_STEP` assumes padding, so pass `--sec_per_step` with `--no-pad_vocab` |
+| `--fused_ce` / `--no-fused_ce` | on in `run.sbatch` / `profile.sbatch` (off when calling `train.py` directly) | Liger fused LM head + cross-entropy (`liger-kernel`): no full fp32 logits, 1.24× faster steps, peak memory 65 → 24 GiB at 64/GPU. `SEC_PER_STEP` assumes it, so pass `--sec_per_step` with `--no-fused_ce` |
 | `--activation` | `gelu_pytorch_tanh` | MLP activation; same formula as GPT-2's `gelu_new` but one fused kernel |
 | `--optimizer` | `adamw` | `adamw` or `adam_mini` |
 | `--weight_decay` | `0.01` | AdamW weight decay |
@@ -47,7 +48,7 @@ sbatch --job-name=gpt2-c4 run.sbatch --run_name=my-run   # defaults = current be
 | `--save_dir` | `~/gpt2_models/<run_name or latest>` | Where the final model is saved |
 
 The step count fills the 30-min job limit: `(TIME_BUDGET − 37 evals × EVAL_SEC) / SEC_PER_STEP[batch]`
-in `train.py` (batch 128 → 7620 steps). Warmup is 10% of the steps. If training runs slow, it stops 90 s before the limit and
+in `train.py` (batch 128 → 9489 steps). Warmup is 10% of the steps. If training runs slow, it stops 90 s before the limit and
 still saves the model. Losses go to W&B (`cerulean-labs/gpt2-training`) and `logs/<job-name>-<job-id>.out`.
 
 ## 3. Push to the Hub

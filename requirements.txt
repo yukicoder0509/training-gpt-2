@@ -6,3 +6,4 @@ adam-mini>=1.1.1
 fasttext>=0.9.3  # 0.9.2 breaks with numpy 2
 wandb
 numpy
+liger-kernel>=0.8  # --fused_ce

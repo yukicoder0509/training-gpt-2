@@ -35,7 +35,7 @@ accelerate launch \
     --num_processes=2 \
     --mixed_precision=bf16 \
     --main_process_port=$((29500 + SLURM_JOB_ID % 1000)) \
-    train.py --model_name=$MODEL_NAME --max_steps=20 --profile_dir=$OUT --pad_vocab \
+    train.py --model_name=$MODEL_NAME --max_steps=20 --profile_dir=$OUT --pad_vocab --fused_ce \
     --save_dir=/tmp/profile-$SLURM_JOB_ID --run_name=profile-$SLURM_JOB_ID "$@"
 
 kill $DMON_PID

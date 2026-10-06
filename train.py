@@ -9,6 +9,7 @@ import argparse
 import time
 from torch.autograd import DeviceType
 from adam_mini import Adam_mini
+from muon_adamw import build_muon_adamw
 
 START_TIME = time.time()
 
@@ -22,6 +23,7 @@ BLOCK_SIZE = 1024
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_name", type=str, required=True, help="Hub repo the saved model is meant for (pushed separately with push_model.py)")
 parser.add_argument("--learning_rate", type=float, default=1.25e-3, help="Peak LR, held constant after warmup")
+parser.add_argument("--warmup_frac", type=float, default=0.01, help="Linear warmup over this fraction of the steps (1%%: ppl 30.77 vs 32.34 at 10%%, 0.5%%: 31.92; jobs 504660, 504157, 504661)")
 parser.add_argument("--decay_frac", type=float, default=0.2, help="0: constant after warmup; >0: warmup-stable-decay, linear decay to 0 over this fraction of the final steps")
 parser.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay (GPT-1: 0.01, GPT-3/nanoGPT: 0.1)")
 parser.add_argument("--beta2", type=float, default=0.95, help="Adam beta2 for both optimizers (0.95: GPT-3/nanoGPT; 0.999: PyTorch default)")
@@ -35,7 +37,9 @@ parser.add_argument("--sec_per_step", type=float, default=None, help="Override t
 parser.add_argument("--max_steps", type=int, default=None, help="Override the time-budgeted step count (e.g. short speed tests)")
 parser.add_argument("--torch_compile", action="store_true", help="torch.compile the model (fuses elementwise/cast kernels; compile time counts against the budget)")
 parser.add_argument("--profile_dir", type=str, default=None, help="Profile steps 9-13 with torch.profiler into this dir (disables eval); see profile.sbatch")
-parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini"], help="adamw (torch AdamW) or adam_mini (Adam-mini, pip adam-mini)")
+parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini", "muon"], help="adamw (torch AdamW), adam_mini (Adam-mini, pip adam-mini) or muon (Muon for block matrices + AdamW for the rest, muon_adamw.py)")
+parser.add_argument("--muon_lr", type=float, default=1.25e-3, help="--optimizer muon: peak Muon LR (match_rms_adamw scaling; best of 1.25e-3..2e-2, >= 1e-2 diverges); --learning_rate is the AdamW part's")
+parser.add_argument("--muon_momentum", type=float, default=0.95, help="--optimizer muon: Muon Nesterov momentum")
 parser.add_argument("--data_dir", type=str, default=os.path.expandvars("/work/$USER/c4_gpt2"), help="Dir with train.bin and val.bin")
 parser.add_argument("--run_name", type=str, default=None, help="W&B run name; also isolates checkpoints in results/<run_name>")
 parser.add_argument("--save_dir", type=str, default=None, help="Where to save the final model (default: ~/gpt2_models/<run_name or latest>)")
@@ -44,7 +48,7 @@ MODEL_NAME = args.model_name
 DATA_DIR = os.path.expanduser(args.data_dir)
 SAVE_DIR = os.path.expanduser(args.save_dir or os.path.join("~/gpt2_models", args.run_name or "latest"))
 
-print("Model name:", MODEL_NAME, "LR:", args.learning_rate, "Optimizer:", args.optimizer, "WD:", args.weight_decay, "beta2:", args.beta2, "Run name:", args.run_name, "Data dir:", DATA_DIR)
+print("Model name:", MODEL_NAME, "LR:", args.learning_rate, "Optimizer:", args.optimizer, *(["Muon LR:", args.muon_lr] if args.optimizer == "muon" else []), "WD:", args.weight_decay, "beta2:", args.beta2, "Run name:", args.run_name, "Data dir:", DATA_DIR)
 
 # The Hub upload runs after the job (push_model.py), so the 30-min limit only covers startup,
 # training and a local save: ~40 s startup, local save + W&B finish < 30 s.
@@ -76,7 +80,7 @@ else:
     MAX_STEPS = int((TIME_BUDGET - NUM_EVALS * EVAL_SEC) / sec_per_step)
 EVAL_STEPS = max(1, MAX_STEPS // NUM_EVALS)
 print(f"Global batch {args.global_batch_size} ({PER_DEVICE_BATCH}/GPU x grad accum {GRAD_ACCUM}), {MAX_STEPS} steps, eval every {EVAL_STEPS}")
-WARMUP_STEPS = int(0.1 * MAX_STEPS)
+WARMUP_STEPS = int(args.warmup_frac * MAX_STEPS)
 DECAY_STEPS = int(args.decay_frac * MAX_STEPS)
 
 # Prepare tokenizer and model
@@ -170,7 +174,7 @@ training_args = TrainingArguments(
     # Was: cosine to 10% of peak ("cosine_with_min_lr", lr_scheduler_kwargs={"min_lr_rate": 0.1})
     lr_scheduler_type="warmup_stable_decay" if DECAY_STEPS else "constant_with_warmup",
     lr_scheduler_kwargs={"num_decay_steps": DECAY_STEPS, "decay_type": "linear"} if DECAY_STEPS else {},
-    warmup_steps=WARMUP_STEPS,  # ~10% of the run
+    warmup_steps=WARMUP_STEPS,  # --warmup_frac of the run (default 1%)
 )
 print("=== Training arguments: ", training_args)
 
@@ -240,6 +244,14 @@ if args.optimizer == "adam_mini":
         verbose=int(os.environ.get("LOCAL_RANK", 0)) == 0,
     )
     optimizer.embd_names.add("wpe")
+elif args.optimizer == "muon":
+    optimizer, muon_names, adamw_names = build_muon_adamw(
+        model, muon_lr=args.muon_lr, muon_momentum=args.muon_momentum,
+        adamw_lr=args.learning_rate, beta2=args.beta2, weight_decay=args.weight_decay,
+    )
+    n = dict(model.named_parameters())
+    print(f"Muon: {len(muon_names)} tensors, {sum(n[k].numel() for k in muon_names) / 1e6:.1f}M params, lr {args.muon_lr}; "
+          f"AdamW: {len(adamw_names)} tensors, {sum(n[k].numel() for k in adamw_names) / 1e6:.1f}M params, lr {args.learning_rate}")
 
 # Trainer
 step_timer = StepTimerCallback()

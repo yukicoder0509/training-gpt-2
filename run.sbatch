@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=24  # 12 per GPU (partition max); 1 CPU slowed NCCL allreduce ~5x (profile 499745 vs 499746)
 #SBATCH --gpus-per-node=2
-#SBATCH --exclude=25a-hgpn001,25a-hgpn003
+#SBATCH --exclude=25a-hgpn001,25a-hgpn003,25a-hgpn157
 #SBATCH --time=0:30:00
 #SBATCH --output=logs/%x-%j.out
 
@@ -48,3 +48,4 @@ echo "========================================"
 # Note:
 # --nodelist=25a-hgpn008  # hgpn003 breaks multi-GPU jobs (jobs 493252, 493275, 493290)
 # hgpn001: both ranks land on the same GPU -> NCCL "Multiple Ranks are using the same GPU" (job 496208)
+# hgpn157: other processes held 137.7 GiB of each GPU -> OOM at startup (job 504613)

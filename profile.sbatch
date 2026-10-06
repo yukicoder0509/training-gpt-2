@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=24  # 12 per GPU (partition max); 1 CPU slowed NCCL allreduce ~5x (profile 499745 vs 499746)
 #SBATCH --gpus-per-node=2
-#SBATCH --exclude=25a-hgpn001,25a-hgpn003
+#SBATCH --exclude=25a-hgpn001,25a-hgpn003,25a-hgpn157
 #SBATCH --time=0:15:00
 #SBATCH --output=logs/%x-%j.out
 

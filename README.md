@@ -38,9 +38,11 @@ sbatch --job-name=gpt2-c4 run.sbatch --run_name=my-run   # defaults = current be
 | `--pad_vocab` / `--no-pad_vocab` | on in `run.sbatch` / `profile.sbatch` (off when calling `train.py` directly) | Pad the vocab 50257 → 50304 so the LM-head matmuls use fast Hopper kernels (1.5× faster steps); trimmed back to 50257 before saving. `SEC_PER_STEP` assumes padding, so pass `--sec_per_step` with `--no-pad_vocab` |
 | `--fused_ce` / `--no-fused_ce` | on in `run.sbatch` / `profile.sbatch` (off when calling `train.py` directly) | Liger fused LM head + cross-entropy (`liger-kernel`): no full fp32 logits, 1.24× faster steps, peak memory 65 → 24 GiB at 64/GPU. `SEC_PER_STEP` assumes it, so pass `--sec_per_step` with `--no-fused_ce` |
 | `--activation` | `gelu_pytorch_tanh` | MLP activation; same formula as GPT-2's `gelu_new` but one fused kernel |
-| `--optimizer` | `adamw` | `adamw` or `adam_mini` |
+| `--optimizer` | `adamw` | `adamw`, `adam_mini`, or `muon` (Muon for the blocks' 2D weights + AdamW for the rest, `muon_adamw.py`; lost to AdamW by ~0.5 ppl at equal time). Muon runs ~5% slower per step, so size them with `--sec_per_step` (0.167 at batch 128) |
+| `--muon_lr` / `--muon_momentum` | `1.25e-3` / `0.95` | Muon peak LR (`match_rms_adamw` scaling; best tested, ≥ 1e-2 diverges) and Nesterov momentum |
 | `--weight_decay` | `0.01` | AdamW weight decay |
 | `--beta2` | `0.95` | Adam β2 |
+| `--warmup_frac` | `0.01` | Linear warmup over this fraction of the steps (1%: ppl 30.77; 10%: 32.34; 0.5%: 31.92) |
 | `--decay_frac` | `0.2` | `0`: constant after warmup; `>0`: warmup-stable-decay, linear decay to 0 over this fraction of the final steps |
 | `--dropout` | `0` | GPT-2's `resid_pdrop`, `attn_pdrop`, `embd_pdrop` (GPT-2 used 0.1) |
 | `--data_dir` | `/work/$USER/c4_gpt2` | Directory with `train.bin` and `val.bin` |
@@ -48,7 +50,7 @@ sbatch --job-name=gpt2-c4 run.sbatch --run_name=my-run   # defaults = current be
 | `--save_dir` | `~/gpt2_models/<run_name or latest>` | Where the final model is saved |
 
 The step count fills the 30-min job limit: `(TIME_BUDGET − 37 evals × EVAL_SEC) / SEC_PER_STEP[batch]`
-in `train.py` (batch 128 → 9489 steps). Warmup is 10% of the steps. If training runs slow, it stops 90 s before the limit and
+in `train.py` (batch 128 → 9489 steps). Warmup is 1% of the steps. If training runs slow, it stops 90 s before the limit and
 still saves the model. Losses go to W&B (`cerulean-labs/gpt2-training`) and `logs/<job-name>-<job-id>.out`.
 
 ## 3. Push to the Hub

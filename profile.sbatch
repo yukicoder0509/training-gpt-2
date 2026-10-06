@@ -27,7 +27,7 @@ OUT=$HOME/training-gpt-2/logs/profile-$SLURM_JOB_ID
 mkdir -p $OUT
 echo "Node: $(hostname)  CPUs: $(nproc)  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
-nvidia-smi dmon -s u -d 1 -o T > $OUT/gpu_util.txt &
+nvidia-smi dmon -s um -d 1 -o T > $OUT/gpu_util.txt &
 DMON_PID=$!
 
 accelerate launch \
@@ -35,10 +35,10 @@ accelerate launch \
     --num_processes=2 \
     --mixed_precision=bf16 \
     --main_process_port=$((29500 + SLURM_JOB_ID % 1000)) \
-    train.py --model_name=$MODEL_NAME --max_steps=20 --profile_dir=$OUT \
+    train.py --model_name=$MODEL_NAME --max_steps=20 --profile_dir=$OUT --pad_vocab \
     --save_dir=/tmp/profile-$SLURM_JOB_ID --run_name=profile-$SLURM_JOB_ID "$@"
 
 kill $DMON_PID
 rm -rf /tmp/profile-$SLURM_JOB_ID
-echo "=== nvidia-smi dmon (sm% / mem% per GPU), profile output in $OUT"
+echo "=== nvidia-smi dmon (sm% / mem% bandwidth, fb MB used per GPU), profile output in $OUT"
 cat $OUT/gpu_util.txt

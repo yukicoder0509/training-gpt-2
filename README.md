@@ -37,6 +37,10 @@ sbatch --job-name=gpt2-c4 run.sbatch --run_name=my-run   # defaults = current be
 | `--per_device_batch` | `64` | Max sequences per GPU per micro-batch; grad accum covers the rest |
 | `--pad_vocab` / `--no-pad_vocab` | on in `run.sbatch` / `profile.sbatch` (off when calling `train.py` directly) | Pad the vocab 50257 → 50304 so the LM-head matmuls use fast Hopper kernels (1.5× faster steps); trimmed back to 50257 before saving. `SEC_PER_STEP` assumes padding, so pass `--sec_per_step` with `--no-pad_vocab` |
 | `--fused_ce` / `--no-fused_ce` | on in `run.sbatch` / `profile.sbatch` (off when calling `train.py` directly) | Liger fused LM head + cross-entropy (`liger-kernel`): no full fp32 logits, 1.24× faster steps, peak memory 65 → 24 GiB at 64/GPU. `SEC_PER_STEP` assumes it, so pass `--sec_per_step` with `--no-fused_ce` |
+| `--torch_compile` / `--no-torch_compile` | on in `run.sbatch` / `profile.sbatch` (off when calling `train.py` directly) | `torch.compile` each transformer block: fuses LayerNorm / cast / GELU / elementwise kernels, 1.12× faster steps (~4 s compile). Compiling the whole `model.transformer` instead made attention 2.7× slower |
+| `--attn_implementation` | `sdpa` | HF attention backend: `sdpa` (cuDNN flash), `flash_attention_2` / `flash_attention_3` (Hub kernels via `kernels`), `flash_attention_4` (`flash-attn-4`). FA3 / FA4 were no faster than `sdpa` here |
+| `--profile_dir` / `--profile_start` / `--profile_cpu` | off / `8` / on | Profile steps start+1..start+5 with torch.profiler (also inside a full run, e.g. `--profile_start=300`); `--no-profile_cpu` = GPU kernels only |
+| `--eval` / `--no-eval` | on | Periodic eval (`profile.sbatch` passes `--no-eval`) |
 | `--activation` | `gelu_pytorch_tanh` | MLP activation; same formula as GPT-2's `gelu_new` but one fused kernel |
 | `--optimizer` | `adamw` | `adamw`, `adam_mini`, or `muon` (Muon for the blocks' 2D weights + AdamW for the rest, `muon_adamw.py`; lost to AdamW by ~0.5 ppl at equal time). Muon runs ~5% slower per step, so size them with `--sec_per_step` (0.167 at batch 128) |
 | `--muon_lr` / `--muon_momentum` | `1.25e-3` / `0.95` | Muon peak LR (`match_rms_adamw` scaling; best tested, ≥ 1e-2 diverges) and Nesterov momentum |
@@ -50,7 +54,7 @@ sbatch --job-name=gpt2-c4 run.sbatch --run_name=my-run   # defaults = current be
 | `--save_dir` | `~/gpt2_models/<run_name or latest>` | Where the final model is saved |
 
 The step count fills the 30-min job limit: `(TIME_BUDGET − 37 evals × EVAL_SEC) / SEC_PER_STEP[batch]`
-in `train.py` (batch 128 → 9489 steps). Warmup is 1% of the steps. If training runs slow, it stops 90 s before the limit and
+in `train.py` (batch 128 → 10334 steps). Warmup is 1% of the steps. If training runs slow, it stops 90 s before the limit and
 still saves the model. Losses go to W&B (`cerulean-labs/gpt2-training`) and `logs/<job-name>-<job-id>.out`.
 
 ## 3. Push to the Hub

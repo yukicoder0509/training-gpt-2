@@ -32,11 +32,15 @@ parser.add_argument("--per_device_batch", type=int, default=64, help="Max sequen
 parser.add_argument("--dropout", type=float, default=0.0, help="Sets GPT-2's resid_pdrop, attn_pdrop and embd_pdrop (GPT-2 used 0.1; 0 won at < 0.2 epoch, job 500119)")
 parser.add_argument("--pad_vocab", action=argparse.BooleanOptionalAction, default=False, help="Pad the vocab 50257 -> 50304 (multiple of 128) for fast LM-head GEMMs; trimmed back before saving. On in run.sbatch/profile.sbatch; --no-pad_vocab disables")
 parser.add_argument("--fused_ce", action=argparse.BooleanOptionalAction, default=False, help="Liger fused LM head + cross-entropy: never materializes the full fp32 logits. On in run.sbatch/profile.sbatch; --no-fused_ce disables")
+parser.add_argument("--attn_implementation", type=str, default="sdpa", help="HF attention backend: sdpa (cuDNN flash), flash_attention_3 (Hub kernel kernels-community/vllm-flash-attn3 via `kernels`), flash_attention_4 (pip flash-attn-4, CuTe DSL)")
 parser.add_argument("--activation", type=str, default="gelu_pytorch_tanh", help="MLP activation: gelu_pytorch_tanh (fused, same formula) or gelu_new (GPT-2 original, ~8 elementwise kernels)")
 parser.add_argument("--sec_per_step", type=float, default=None, help="Override the measured train-step time (s, excl. eval) used to size the run")
 parser.add_argument("--max_steps", type=int, default=None, help="Override the time-budgeted step count (e.g. short speed tests)")
-parser.add_argument("--torch_compile", action="store_true", help="torch.compile the model (fuses elementwise/cast kernels; compile time counts against the budget)")
-parser.add_argument("--profile_dir", type=str, default=None, help="Profile steps 9-13 with torch.profiler into this dir (disables eval); see profile.sbatch")
+parser.add_argument("--torch_compile", action=argparse.BooleanOptionalAction, default=False, help="torch.compile each transformer block (not the mask setup or the Liger loss): fuses LayerNorm/cast/GELU/elementwise kernels, 1.12x faster steps. On in run.sbatch/profile.sbatch; --no-torch_compile disables")
+parser.add_argument("--profile_dir", type=str, default=None, help="Profile 5 steps with torch.profiler into this dir; works inside a full run (see --profile_start) or in profile.sbatch")
+parser.add_argument("--profile_start", type=int, default=8, help="Profile steps profile_start+1 .. profile_start+5 (pick a window without an eval step in a full run, e.g. 300)")
+parser.add_argument("--profile_cpu", action=argparse.BooleanOptionalAction, default=True, help="Also record CPU ops (shows what causes GPU gaps, slightly slows launches); --no-profile_cpu = GPU kernels only")
+parser.add_argument("--eval", action=argparse.BooleanOptionalAction, default=True, help="Periodic eval (--no-eval for short speed/profile jobs, see profile.sbatch)")
 parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini", "muon"], help="adamw (torch AdamW), adam_mini (Adam-mini, pip adam-mini) or muon (Muon for block matrices + AdamW for the rest, muon_adamw.py)")
 parser.add_argument("--muon_lr", type=float, default=1.25e-3, help="--optimizer muon: peak Muon LR (match_rms_adamw scaling; best of 1.25e-3..2e-2, >= 1e-2 diverges); --learning_rate is the AdamW part's")
 parser.add_argument("--muon_momentum", type=float, default=0.95, help="--optimizer muon: Muon Nesterov momentum")
@@ -60,13 +64,15 @@ TIME_BUDGET = JOB_TIME_LIMIT - 30 - 45 - 120  # startup, save + W&B finish + lau
 NUM_EVALS = 37
 EVAL_SEC = 2.6  # 5k val docs; measured 2.49 s/eval (max 2.54) with gelu_pytorch_tanh (job 500119); was 6.34 with gelu_new
 # Train-step time (s, excl. eval) on 2 GPUs by global batch size, with 24 CPUs, gelu_pytorch_tanh, up to
-# 64 seqs/GPU, dropout 0, --pad_vocab and --fused_ce (the run.sbatch defaults). Medians from speed jobs 504142-504145
-# (64: 0.091, 128: 0.156, 256: 0.308, 512: 0.617), scaled by 1.017 = full-run mean / speed-job median without
-# padding (job 500119: 0.298 incl. logging, vs 0.293 median in 503440). Re-measure with profile.sbatch if the setup changes.
-# --pad_vocab without --fused_ce (503436-503439): 64: 0.106, 128: 0.198, 256: 0.393, 512: 0.770.
+# 64 seqs/GPU, dropout 0, --pad_vocab, --fused_ce and --torch_compile (the run.sbatch defaults).
+# 128: full-run mean 0.145 s (job 504863: (1557 s train_runtime - 66 s eval) / 10263) + ~1% margin.
+# 64/256/512: NOT measured with compile; the --no-torch_compile values below scaled by 0.146 / 0.159 (re-measure
+# with profile.sbatch before relying on them). Re-measure with profile.sbatch if the setup changes.
+# --pad_vocab --fused_ce without compile (speed jobs 504142-504145 x 1.017): 64: 0.093, 128: 0.159, 256: 0.313, 512: 0.627.
+# --pad_vocab only (503436-503439): 64: 0.106, 128: 0.198, 256: 0.393, 512: 0.770.
 # Neither: 64: 0.161, 128: 0.298, 256: 0.606, 512: 1.208. Pass --sec_per_step to size such runs.
 # Before the throughput fixes (1 CPU, gelu_new, 32/GPU): 64: 0.249, 128: 0.469, 256: 0.912, 512: 1.824.
-SEC_PER_STEP = {64: 0.093, 128: 0.159, 256: 0.313, 512: 0.627}
+SEC_PER_STEP = {64: 0.085, 128: 0.146, 256: 0.287, 512: 0.576}
 # Fewer, larger micro-batches: fewer kernel launches and fewer autocast weight casts per step (profile 499746).
 PER_DEVICE_BATCH = min(args.per_device_batch, args.global_batch_size // int(os.environ.get("WORLD_SIZE", 1)))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
@@ -99,7 +105,7 @@ config = AutoConfig.from_pretrained(
     # Padded rows never appear as targets; training just pushes their logits down.
     **({"vocab_size": 50304} if args.pad_vocab else {}),
 )
-model = AutoModelForCausalLM.from_config(config)
+model = AutoModelForCausalLM.from_config(config, attn_implementation=args.attn_implementation)
 print("Attention implementation:", model.config._attn_implementation)
 
 # Fused LM head + cross-entropy (Liger): computes the logits, loss and their gradients chunk by chunk inside
@@ -124,6 +130,12 @@ if args.fused_ce:
         return CausalLMOutputWithCrossAttentions(loss=loss)
 
     model.forward = fused_ce_forward
+
+# Compile only the transformer body: the memory-bound LayerNorm / cast / GELU / elementwise kernels are ~37% of GPU
+# time there (profile 504143), while the LM head + loss stays in Liger's kernels outside the compiled graph.
+if args.torch_compile:
+    for block in model.transformer.h:
+        block.compile()
 
 # Load English C4 dataset
 print("=== Loading English C4 dataset...")
@@ -150,14 +162,13 @@ training_args = TrainingArguments(
     per_device_train_batch_size=PER_DEVICE_BATCH,
     gradient_accumulation_steps=GRAD_ACCUM,
     bf16=True,
-    torch_compile=args.torch_compile,
     num_train_epochs=1,
     max_steps=MAX_STEPS,
 
     # Logging, eval and reporting
     logging_steps=10,
     report_to="wandb",  # Log to W&B
-    eval_strategy="no" if args.profile_dir else "steps",
+    eval_strategy="steps" if args.eval else "no",
     eval_steps=EVAL_STEPS,
     save_strategy="no",
 
@@ -256,20 +267,23 @@ elif args.optimizer == "muon":
 # Trainer
 step_timer = StepTimerCallback()
 
-# torch.profiler over a few steady-state steps: Chrome trace per rank, plus (rank 0) top ops by GPU and
-# CPU time and the GPU busy fraction (sum of GPU-side events: kernels, memcpy, memset / wall time; NCCL overlap
-# can push it slightly above 100%). Same sum as the table footer: CPU ops (aten::mm) and GPU-side user annotations
-# (ProfilerStep*, DistributedDataParallel.forward) are excluded, since their self device time repeats the time
-# of the kernels they launch or enclose.
+# torch.profiler over 5 steady-state steps: Chrome trace per rank, plus (rank 0) top ops by GPU and CPU time and the
+# GPU busy fraction (sum of GPU-side events: kernels, memcpy, memset / wall time; NCCL overlap can push it slightly
+# above 100%). Same sum as the table footer: CPU ops (aten::mm) and GPU-side user annotations (ProfilerStep*,
+# DistributedDataParallel.forward) are excluded, since their self device time repeats the time of the kernels they
+# launch or enclose. The GPU is synchronized only at the two window edges (to time the window), so the CPU can queue
+# work ahead as in an unprofiled run; a sync after every step exposed the batch-loading gap as ~9% fake idle (504143).
 class ProfilerCallback(TrainerCallback):
-    WAIT, WARMUP, ACTIVE = 5, 3, 5
+    WARMUP, ACTIVE = 3, 5
 
-    def __init__(self, out_dir):
-        self.out_dir, self.t_active = out_dir, None
+    def __init__(self, out_dir, start, cpu):
+        self.out_dir, self.t_active, self.t_end, self.cpu = out_dir, None, None, cpu
+        self.first, self.last = start, start + self.ACTIVE  # timed window: steps first+1 .. last
         os.makedirs(out_dir, exist_ok=True)
+        activities = [torch.profiler.ProfilerActivity.CUDA] + ([torch.profiler.ProfilerActivity.CPU] if cpu else [])
         self.prof = torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(wait=self.WAIT, warmup=self.WARMUP, active=self.ACTIVE, repeat=1),
+            activities=activities,
+            schedule=torch.profiler.schedule(wait=start - self.WARMUP, warmup=self.WARMUP, active=self.ACTIVE, repeat=1),
             on_trace_ready=self.report,
         )
 
@@ -277,16 +291,19 @@ class ProfilerCallback(TrainerCallback):
         self.prof.start()
 
     def on_step_end(self, args, state, control, **kwargs):
-        torch.cuda.synchronize()
-        if state.global_step == self.WAIT + self.WARMUP:
+        if state.global_step in (self.first, self.last):
+            torch.cuda.synchronize()
+        if state.global_step == self.first:
             self.t_active = time.time()  # active window starts with the next step
+        if state.global_step == self.last:
+            self.t_end = time.time()  # before prof.step(), which collects the trace (~0.25 s) and calls report
         self.prof.step()
 
     def on_train_end(self, args, state, control, **kwargs):
         self.prof.stop()
 
     def report(self, prof):
-        wall = time.time() - self.t_active
+        wall = self.t_end - self.t_active
         rank = int(os.environ.get("RANK", 0))
         prof.export_chrome_trace(os.path.join(self.out_dir, f"trace_rank{rank}.json"))
         # Peak since process start (covers optimizer state init and the logits/loss spike), vs. GPU capacity
@@ -298,9 +315,9 @@ class ProfilerCallback(TrainerCallback):
             return
         events = prof.key_averages()
         gpu_us = sum(e.self_device_time_total for e in events if e.device_type == DeviceType.CUDA and not e.is_user_annotation)
-        print(f"=== Profile: {self.ACTIVE} steps, wall {wall:.3f} s ({wall / self.ACTIVE:.3f} s/step), "
+        print(f"=== Profile: steps {self.first + 1}-{self.last}, wall {wall:.3f} s ({wall / self.ACTIVE:.3f} s/step), "
               f"GPU kernel time {gpu_us / 1e6:.3f} s -> GPU busy {gpu_us / 1e6 / wall:.0%}, CPUs available {len(os.sched_getaffinity(0))}")
-        for key in ("self_device_time_total", "self_cpu_time_total"):
+        for key in ("self_device_time_total",) + (("self_cpu_time_total",) if self.cpu else ()):
             print(f"=== Top ops by {key}")
             print(events.table(sort_by=key, row_limit=25, max_name_column_width=60))
 
@@ -322,7 +339,7 @@ trainer = CustomTrainer(
     train_dataset=train_ds,
     eval_dataset=val_ds,
     callbacks=[DeadlineCallback(START_TIME + JOB_TIME_LIMIT - 90), step_timer]
-    + ([ProfilerCallback(args.profile_dir)] if args.profile_dir else []),
+    + ([ProfilerCallback(args.profile_dir, args.profile_start, args.profile_cpu)] if args.profile_dir else []),
     optimizers=(optimizer, None),  # None -> Trainer builds AdamW from args; scheduler always from args
 )
 

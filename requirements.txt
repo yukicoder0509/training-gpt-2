@@ -7,3 +7,5 @@ fasttext>=0.9.3  # 0.9.2 breaks with numpy 2
 wandb
 numpy
 liger-kernel>=0.8  # --fused_ce
+flash-attn-4  # --attn_implementation flash_attention_4
+kernels  # Hub attention kernels (flash_attention_2 / flash_attention_3)

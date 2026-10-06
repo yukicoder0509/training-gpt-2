@@ -37,7 +37,7 @@ accelerate launch \
     --num_processes=2 \
     --mixed_precision=bf16 \
     --main_process_port=$((29500 + SLURM_JOB_ID % 1000)) \
-    train.py --model_name=$MODEL_NAME --pad_vocab --fused_ce "$@"  # --no-pad_vocab / --no-fused_ce to disable
+    train.py --model_name=$MODEL_NAME --pad_vocab --fused_ce --torch_compile "$@"  # --no-pad_vocab / --no-fused_ce / --no-torch_compile to disable
 
 END_TIME=$(date +%s)
 echo "========================================"

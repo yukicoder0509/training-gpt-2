@@ -12,6 +12,8 @@
 
 # Short profiling run: same setup as run.sbatch, 20 steps, no eval / W&B / Hub. torch.profiler records
 # steps 9-13 (train.py --profile_dir) and nvidia-smi samples GPU utilization every second.
+# To profile inside a real full run instead: sbatch run.sbatch --profile_dir=logs/profile-<name> --profile_start=300
+# (add --no-profile_cpu for GPU kernels only, lowest overhead).
 # Extra args go to train.py. Compare CPU counts by overriding sbatch's --cpus-per-task, e.g.:
 #   sbatch --cpus-per-task=1 --job-name=gpt2-profile-cpu1 profile.sbatch
 # Output: logs/profile-<job id>/ (trace_rank*.json for chrome://tracing or ui.perfetto.dev, gpu_util.txt)
@@ -35,7 +37,7 @@ accelerate launch \
     --num_processes=2 \
     --mixed_precision=bf16 \
     --main_process_port=$((29500 + SLURM_JOB_ID % 1000)) \
-    train.py --model_name=$MODEL_NAME --max_steps=20 --profile_dir=$OUT --pad_vocab --fused_ce \
+    train.py --model_name=$MODEL_NAME --max_steps=20 --no-eval --profile_dir=$OUT --pad_vocab --fused_ce --torch_compile \
     --save_dir=/tmp/profile-$SLURM_JOB_ID --run_name=profile-$SLURM_JOB_ID "$@"
 
 kill $DMON_PID
